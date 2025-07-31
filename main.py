@@ -315,7 +315,7 @@ if __name__ == '__main__':
     # 绘图
     plotter = Plotter()
     # MADDPG
-    run_with_MADDPG(plotter, 'none', epochs=10)#300
+    run_with_MADDPG(plotter, 'none', epochs=300)#300
     # 时间窗消融实验
     # time_window_ablation_experiment(plotter, epochs=300)
     # GA
