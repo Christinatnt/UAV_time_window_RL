@@ -36,7 +36,7 @@ class UAVEnv:
 
         # 验证紧时间窗
         init_positions = [
-                             [50, 50]
+                             [20, 56]
                          ][:self.num_uav]
         # init_positions = [
         #                      [20, 90], [85, 15], [15, 15]
@@ -140,10 +140,10 @@ class UAVEnv:
             #     k = unfinished[np.argmin(dists)]  # 选择最近的未完成任务
 
             # 2. 强制重新定向到最紧急任务（如果当前目标非最紧急）
-            if k != most_urgent and distance(self.uav_pos[i], self.task_pos[k][:2]) > self.d_max:
-                k = most_urgent  # 切换到最紧急任务
-                theta = np.arctan2(self.task_pos[k][1] - self.uav_pos[i][1],
-                                   self.task_pos[k][0] - self.uav_pos[i][0])  # 直接朝向新目标
+            # if k != most_urgent and distance(self.uav_pos[i], self.task_pos[k][:2]) > self.d_max:
+            #     k = most_urgent  # 切换到最紧急任务
+            #     theta = np.arctan2(self.task_pos[k][1] - self.uav_pos[i][1],
+            #                        self.task_pos[k][0] - self.uav_pos[i][0])  # 直接朝向新目标
 
             # 基于动作更新 UAV 的位置（带限位）
             dx = v * np.cos(theta) * self.dt
@@ -186,8 +186,8 @@ class UAVEnv:
             R_E = E_f + E_s  # 能耗惩罚
 
             # 吸引任务点：鼓励靠近未完成任务
-            # R_attract = -min([distance(self.uav_pos[i], self.task_pos[k][:2])
-            #                   for k in unfinished], default=0) / MAP_SIZE
+            R_attract = -min([distance(self.uav_pos[i], self.task_pos[k][:2])
+                              for k in unfinished], default=0) / MAP_SIZE
 
             # time_remaining = {}
             # for j in withinTW:
@@ -232,7 +232,7 @@ class UAVEnv:
             R_idle = -1.0 if v < 1e-3 else 0.0
 
             # 综合计算当前 UAV 的总奖励
-            reward = (self.a1 * R_S + self.a2 * R_D - self.a3 * R_E / E_MAX - self.a4 * R_C  # + self.a6 * R_attract
+            reward = (self.a1 * R_S + self.a2 * R_D - self.a3 * R_E / E_MAX - self.a4 * R_C   + self.a6 * R_attract
                       + self.a7 * R_border + self.a8 * R_TW + 5.0 * R_switch)  # + self.a8 * R_fair + 2.0 * R_idle)
             rewards.append(reward)
 
