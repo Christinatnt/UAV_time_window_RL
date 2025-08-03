@@ -114,13 +114,12 @@ class MADDPG:
         self.train_step = 0
         self.actor = [Actor(self.obs_dim, self.act_dim) for _ in range(self.num_agents)]
 
-
-        self.actor_optim = [tf.keras.optimizers.Adam(1e-4) for _ in range(self.num_agents)]#原来为1e-3
-        self.critic_optim = [tf.keras.optimizers.Adam(1e-3) for _ in range(self.num_agents)]#原来为1e-3
+        self.actor_optim = [tf.keras.optimizers.Adam(1e-4) for _ in range(self.num_agents)]  # 原来为1e-3
+        self.critic_optim = [tf.keras.optimizers.Adam(1e-3) for _ in range(self.num_agents)]  # 原来为1e-3
 
         self.replay_buffer = ReplayBuffer()
         self.gamma = 0.95
-        self.batch_size = 256#256#64
+        self.batch_size = 256  # 256#64
 
         # 初始化目标网络
         self.target_actor = [Actor(self.obs_dim, self.act_dim) for _ in range(self.num_agents)]
@@ -130,29 +129,29 @@ class MADDPG:
         self.critic = [Critic(obs_all_dim, act_all_dim) for _ in range(self.num_agents)]
         self.target_critic = [Critic(obs_all_dim, act_all_dim) for _ in range(self.num_agents)]
 
-        self.noise_std = 0.1#0.2  # 控制随机性幅度
+        self.noise_std = 0.1  # 0.2  # 控制随机性幅度
         self.epsilon = 1.0  # 初始探索率为 1.0，逐步衰减
-        self.epsilon_min = 0.1#0.05
-        self.epsilon_decay = 0.997#0.995
+        self.epsilon_min = 0.1  # 0.05
+        self.epsilon_decay = 0.997  # 0.995
 
         # 保存运行数据
         self.finish_time = {}
         self.best_task_rate = 0.0
         self.uav_trajectories = [[] for _ in range(UAV_NUM)]
 
-        #为智能体并行化预先分配内存
-        self.obs_flat = tf.Variable(tf.zeros([self.batch_size, self.obs_dim*self.num_agents]))
-        self.next_obs_flat = tf.Variable(tf.zeros([self.batch_size, self.obs_dim*self.num_agents]))
-        self.act_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim*self.num_agents]))
-        self.target_acts_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim*self.num_agents]))
-        self.new_acts_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim*self.num_agents]))
+        # 为智能体并行化预先分配内存
+        self.obs_flat = tf.Variable(tf.zeros([self.batch_size, self.obs_dim * self.num_agents]))
+        self.next_obs_flat = tf.Variable(tf.zeros([self.batch_size, self.obs_dim * self.num_agents]))
+        self.act_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim * self.num_agents]))
+        self.target_acts_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim * self.num_agents]))
+        self.new_acts_flat = tf.Variable(tf.zeros([self.batch_size, self.act_dim * self.num_agents]))
 
         # 拷贝权重
         for i in range(self.num_agents):
             self.update_target_network(self.target_actor[i], self.actor[i])
             self.update_target_network(self.target_critic[i], self.critic[i])
 
-        #保存模型Checkpointing
+        # 保存模型Checkpointing
         self.ckpt_dir = "MADDPG_checkpoints"
         self.actor_ckpt = os.path.join(self.ckpt_dir, "actor")
         self.critic_ckpt = os.path.join(self.ckpt_dir, "critic")
@@ -219,7 +218,7 @@ class MADDPG:
             with tf.device('/GPU:0'):
                 # 直接切片获取单个智能体的观测（避免重复转换）
                 obs_i = obs[i:i + 1]  # 保持批处理维度 [1, obs_dim]
-                output=self.actor[i](obs_i)
+                output = self.actor[i](obs_i)
                 output = output[0].numpy()  # 取第一个（也是唯一一个）样本
 
             # 加噪探索
@@ -291,11 +290,6 @@ class MADDPG:
                     y = reward_batch[:, i] + self.gamma * tf.squeeze(target_q)  # 直接使用 gamma 乘 target_q
                     y = tf.clip_by_value(y, -1000.0, 100.0)  # 保持值裁剪
 
-                    # 计算当前Q值
-                    # current_q = tf.squeeze(self.critic[i](
-                    #     tf.reshape(obs_batch, [self.batch_size, -1]),
-                    #     tf.reshape(act_batch, [self.batch_size, -1])
-                    # ))
                     current_q = self.critic[i](obs_concat, act_concat)
                     critic_loss = tf.keras.losses.Huber()(y, tf.squeeze(current_q))
 
@@ -332,14 +326,14 @@ class MADDPG:
         for target_param, param in zip(target.trainable_variables, source.trainable_variables):
             target_param.assign(tau * param + (1 - tau) * target_param)
 
-    #训练
+    # 训练
     def train(self, epochs=500):
 
         # 多次运行以获取统计数据
         all_rewards = []
         all_task_completion = []
         all_collisions = []
-
+        all_fairness = []
 
         for episode in range(epochs):  # 100
             # 记录开始时间
@@ -360,7 +354,7 @@ class MADDPG:
 
                 # next_states, rewards, done, info = self.env.step(actions)  # 执行动作
                 try:
-                    next_states, rewards, done, info = self.env.step(actions)
+                    next_states, rewards, done, info = self.env.step(actions, episode < epochs * 0.2)
                 except Exception as e:
                     print(f"Env step failed: {str(e)}")
                     break
@@ -394,13 +388,15 @@ class MADDPG:
             all_rewards.append(np.sum(episode_reward))
             all_task_completion.append(info['tasks_completed'])
             all_collisions.append(info['collision'])
+            all_fairness.append(info['fairness'])
 
             print(f"回合 {episode}, 平均奖励: {np.mean(episode_reward):.2f}, "
                   f"任务完成率: {info['tasks_completed']:.2f}, 碰撞次数: {info['collision']}")
 
-            if episode < epochs/2:
-                self.uav_trajectories = self.env.uav_trajectories
-            elif self.best_task_rate <= info['tasks_completed']:
+            # if episode < epochs/2:
+            #     self.uav_trajectories = self.env.uav_trajectories
+            # el
+            if self.best_task_rate <= info['tasks_completed']:
                 self.best_task_rate = info['tasks_completed']
                 self.uav_trajectories = self.env.uav_trajectories
                 self.finish_time = self.env.finish_time
@@ -416,7 +412,7 @@ class MADDPG:
             print(f"运行 {episode} 完成，耗时 {interval:.2f} 秒")
 
         self.save_models()
-        return all_rewards, all_task_completion, all_collisions
+        return all_rewards, all_task_completion, all_collisions, all_fairness
 
     def test(self, epochs=500):
         self.epsilon = 0.0  # 禁用探索

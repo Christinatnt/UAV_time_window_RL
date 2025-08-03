@@ -17,7 +17,7 @@ import json
 def run_with_MADDPG(plotter, time_window_type, epochs=500):
     env = UAVEnv(time_window_type)
     maddpg = MADDPG(env)
-    all_reward, all_completion, all_collision = maddpg.train(epochs)
+    all_reward, all_completion, all_collision, all_fairness = maddpg.train(epochs)
     # 绘制奖励曲线
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -36,10 +36,19 @@ def run_with_MADDPG(plotter, time_window_type, epochs=500):
                          title="UAV Task Completion Rate",
                          xlabel="Iteration number",
                          ylabel="Task completion rate",
-                         smooth=False,
+                         smooth=True,
                          window=5,
                          # save_name=f"MADDPG_task_completion_{timestamp}")
                          save_name=f"MADDPG_task_completion")
+    # 能耗均衡曲线
+    plotter.plot_rewards([all_fairness],
+                         title="UAV Energy Fairness Rate",
+                         xlabel="Iteration number",
+                         ylabel="Fairness index",
+                         smooth=True,
+                         window=5,
+                         # save_name=f"MADDPG_task_completion_{timestamp}")
+                         save_name=f"MADDPG_energy_fairness")
 
     # 碰撞次数曲线
     '''plotter.plot_rewards(all_collisions,
@@ -65,9 +74,9 @@ def run_with_MADDPG(plotter, time_window_type, epochs=500):
                                   title="UAV Trajectory and Task Distribution",
                                   save_name=f"MADDPG_trajectory_plot_{time_window_type}")
     # save_name=f"MADDPG_trajectory_plot__{timestamp}")
-    print(f"best task rate: {maddpg.best_task_rate}")
     # 绘制奖励函数曲线
     plotter.plot_reward_components(env.reward_history)
+    print(f"best task rate: {maddpg.best_task_rate}")
     if maddpg.finish_time:
         for k, t in maddpg.finish_time.items():
             print(f"{k}:{t}")
@@ -315,7 +324,7 @@ if __name__ == '__main__':
     # 绘图
     plotter = Plotter()
     # MADDPG
-    run_with_MADDPG(plotter, 'none', epochs=300)#300
+    run_with_MADDPG(plotter, 'normal', epochs=300)#300
     # 时间窗消融实验
     # time_window_ablation_experiment(plotter, epochs=300)
     # GA

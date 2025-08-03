@@ -20,27 +20,24 @@ class UAVEnv:
         self.T = TIME_STEPS
         self.t = 0
 
-        # 验证紧时间窗
+        # 验证时间窗约束
         # task_pos_2d = np.array([
-        #     [40, 35], [35, 55], [50, 65], [65, 55], [60, 35]
+        #     [38.24, 33.82], [30.98, 56.18], [50, 70], [69.02, 56.18], [61.76, 33.82]
         # ], dtype=np.float32)
         task_pos_2d = np.array([
-            [38.24, 33.82], [30.98, 56.18], [50, 70], [69.02, 56.18], [61.76, 33.82]
+            [20, 28], [25, 23], [38, 30], [75, 25], [80, 40],
+            [20, 40], [35, 55], [50, 55], [70, 50], [78, 60],
+            [30, 71], [45, 78], [25, 80], [75, 75], [80, 69]
         ], dtype=np.float32)
-        # task_pos_2d = np.array([
-        #     [20, 28], [25, 23], [38, 30], [75, 25], [80, 40],
-        #     [20, 40], [35, 55], [50, 55], [70, 50], [78, 60],
-        #     [30, 71], [45, 78], [25, 80], [75, 75], [80, 69]
-        # ], dtype=np.float32)
         self.task_pos = np.hstack((task_pos_2d, np.zeros((self.num_task, 1))))
 
-        # 验证紧时间窗
-        init_positions = [
-                             [20, 56]
-                         ][:self.num_uav]
+        # 验证时间窗约束
         # init_positions = [
-        #                      [20, 90], [85, 15], [15, 15]
+        #                      [20, 56]
         #                  ][:self.num_uav]
+        init_positions = [
+                             [20, 90], [85, 15], [15, 15]
+                         ][:self.num_uav]
         self.uav_pos = np.array(init_positions, dtype=np.float32)
 
         # self.task_window = [(5, 90) for _ in range(self.num_task)]
@@ -49,13 +46,12 @@ class UAVEnv:
         self.task_marked = np.zeros(self.num_task, dtype=bool)  # 标记任务是否完成Bool
         self.energy = np.zeros(self.num_uav)
         self.load = np.zeros(self.num_uav)
-        self.last_task_choice = [-1] * self.num_uav
+        # self.last_task_choice = [-1] * self.num_uav
         self.reward_history = {'R_S': [], 'R_D': [], 'R_E': [], 'R_C': [], 'R_global': [],
                                'R_attract': [], 'R_border': [], 'R_TW': []}  # 记录奖励函数曲线
 
         self.H = H
         self.v_max = V_MAX
-        # self.P_req = P_REQ
         self.E_max = E_MAX
         self.d_safe = D_SAFE
         self.d_max = D_MAX
@@ -73,6 +69,10 @@ class UAVEnv:
         self.a6 = A6
         self.a7 = A7
         self.a8 = A8
+        self.a9 = A9
+
+        self.alpha = 3.0
+        self.beta = 2.0
 
         self.uav_trajectories = [[] for _ in range(self.num_uav)]
         for i in range(self.num_uav):
@@ -88,7 +88,15 @@ class UAVEnv:
             # self.task_window = [(i, i + 30 - 1) for i in range(50, TIME_STEPS, 30)] #50~500区间，每个任务窗口期为30,紧锣密鼓的挨着
             self.task_window = [(0, 30), (30, 50), (50, 65), (65, 80), (80, 100)]
         else:
-            self.task_window = [(5, 90) for _ in range(self.num_task)]  # 默认情况
+            # self.task_window = [(5, 90) for _ in range(self.num_task)]  # 默认情况
+            self.task_window = []
+            min_window, max_window = 30, 60  # 窗口大小范围
+            for _ in range(self.num_task):
+                # 随机窗口大小（30-60）
+                win_size = np.random.randint(min_window, max_window + 1)
+                # 随机起始时间（确保窗口不超出总时长）
+                start = np.random.randint(0, self.T - win_size + 1)
+                self.task_window.append((start, start + win_size))
 
         self.finish_time = {k: 0 for k in range(self.num_task)}  # 记录任务完成时间
 
@@ -112,12 +120,14 @@ class UAVEnv:
             obs.append(uav_obs)
         return obs
 
-    def step(self, actions):
+    def step(self, actions, if_self_learn):
         rewards = []
         prev_pos = self.uav_pos.copy()  # 记录每架 UAV 当前的位置，用于后续计算移动距离
         p_individual = np.zeros((self.num_uav, self.num_task))  # 每个 UAV 对每个任务的感知概率
         delta = np.zeros((self.num_uav, self.num_task))  # 每个 UAV 对每个任务的时间窗调制值
         task_participants = {j: [] for j in range(self.num_task)}  # 每个任务的参与 UAV 列表
+        # Jain公平指数计算
+        fairness = self.calculate_fairness(self) # 能耗均衡
 
         for i, (v, theta, k) in enumerate(actions):
             # 获取未完成的任务编号
@@ -131,19 +141,36 @@ class UAVEnv:
                     'collision': self._count_collisions(),
                 }
 
-            # 计算全局最紧急任务（剩余时间最少）
-            most_urgent = min(withinTW, key=lambda j: remain_time(self.t, self.task_window[j]))
-
             # # 如果选择的任务已完成，则改为最近的未完成任务
             # if unfinished and self.task_marked[int(k)]:
             #     dists = [distance(self.uav_pos[i], self.task_pos[j][:2]) for j in unfinished]
             #     k = unfinished[np.argmin(dists)]  # 选择最近的未完成任务
 
             # 2. 强制重新定向到最紧急任务（如果当前目标非最紧急）
+            # 计算全局最紧急任务（剩余时间最少）
+            # most_urgent = min(withinTW, key=lambda j: remain_time(self.t, self.task_window[j]))
             # if k != most_urgent and distance(self.uav_pos[i], self.task_pos[k][:2]) > self.d_max:
             #     k = most_urgent  # 切换到最紧急任务
             #     theta = np.arctan2(self.task_pos[k][1] - self.uav_pos[i][1],
             #                        self.task_pos[k][0] - self.uav_pos[i][0])  # 直接朝向新目标
+
+            # V3.0
+            scores = []
+            reward = 0.0
+            for j in withinTW:
+                urgency = 1.0 - remain_time(self.t, self.task_window[j])
+                closest = distance(self.uav_pos[i], self.task_pos[j][:2])
+                # scores.append(urgency / (closest + 1e-5))
+                scores.append(urgency / (closest + 1) + (self.num_task - len(unfinished)) * 0.2)
+            optimal_task = withinTW[np.argmax(scores)]
+            # if if_self_learn:
+            #     k = optimal_task
+            # elif k == optimal_task:
+            #     reward += 20.0#10.0
+            if k != optimal_task and distance(self.uav_pos[i], self.task_pos[k][:2]) > self.d_max:
+                k = optimal_task  # 切换到最紧急任务
+                theta = np.arctan2(self.task_pos[k][1] - self.uav_pos[i][1],
+                                   self.task_pos[k][0] - self.uav_pos[i][0])
 
             # 基于动作更新 UAV 的位置（带限位）
             dx = v * np.cos(theta) * self.dt
@@ -157,12 +184,14 @@ class UAVEnv:
             # 计算与任务点的距离
             dist = distance(self.uav_pos[i], self.task_pos[k][:2])
             # 计算 UAV 的感知概率（超出最大感知距离则为 0）
-            P = np.exp(-self.xi * dist) if dist <= self.d_max else 0.0
+            # P = np.exp(-self.xi * dist) if dist <= self.d_max else 0.0
+            P = 1 if dist <= self.d_max else 0.0  # TODO
 
             # 时间窗调制项，越靠近中心时间越高
             start_t, end_t = self.task_window[k]
             center_t = (start_t + end_t) / 2
-            delta_k = np.exp(-self.lambda_ * abs(self.t - center_t)) if start_t <= self.t <= end_t else 0.0
+            # delta_k = np.exp(-self.lambda_ * abs(self.t - center_t)) if start_t <= self.t <= end_t else 0.0
+            delta_k = 1 if start_t <= self.t <= end_t else 0.0  # TODO
 
             # 保存感知精度与时间窗调制系数
             p_individual[i, k] = P
@@ -180,60 +209,70 @@ class UAVEnv:
 
             # 计算奖励各项分量
             R_S = delta_k * P  # 时间窗调制的感知成功概率奖励
-            # R_D = np.exp(-self.xi * dist)
-            R_D = 0.5 * np.exp(-self.xi * dist) + 0.5 / (1.0 + self.xi * dist)  # 目标靠近 shaping 奖励
+            R_D = np.exp(-self.xi * dist)
+            # R_D = 0.5 * np.exp(-self.xi * dist) + 0.5 / (1.0 + self.xi * dist)  # 目标靠近 shaping 奖励
+
             R_C = self._calculate_collision_reward_single(i)  # 碰撞惩罚
             R_E = E_f + E_s  # 能耗惩罚
 
+            # 能耗均衡问题
+            # 计算归一化能耗比例（防止除零）
+            energy_normalized = self.energy / (E_MAX + 1e-8)
+
+
+
+            # 公平性奖励（范围[-1,1]）
+            R_Fairness = 2.0 * (fairness - 0.5)
+
             # 吸引任务点：鼓励靠近未完成任务
-            R_attract = -min([distance(self.uav_pos[i], self.task_pos[k][:2])
-                              for k in unfinished], default=0) / MAP_SIZE
+            # R_attract = -min([distance(self.uav_pos[i], self.task_pos[k][:2])
+            #                   for k in unfinished], default=0) / MAP_SIZE
+            # temp = min([distance(self.uav_pos[i], self.task_pos[k][:2])
+            #                   for k in unfinished], default=0)
+            # R_attract = 1.0 / (1.0 + temp) * 5.0
 
-            # time_remaining = {}
+            # weighted_dists = []
             # for j in withinTW:
-            #     time_remaining[j] = remain_time(self.t, self.task_window[j])
-            # # 找到时间最紧迫的任务（剩余时间比例最小的）
-            # most_urgent_idx = np.argmin(time_remaining)  # argmin返回数组中最小元素的索引
-            # most_urgent_task = withinTW[most_urgent_idx]
-            # # 设计奖励函数（距离越近奖励越高，时间越紧迫权重越大）
-            # urgency_weight = 1.0 - time_remaining[most_urgent_idx]  # 紧迫性系数[0,1]
-            # a = distance(self.uav_pos[i], self.task_pos[most_urgent_task][:2])
-            # # temp = (1.0 - a / MAP_SIZE)
-            # dist_factor = np.exp(-self.xi * a)
-            # # R_TW = urgency_weight * dist_factor #1.0 - time_remaining  #  # 时间窗奖励
-            # R_TW = (1.0 - time_remaining[k]) if k in withinTW else 0
+            #     a = 1.0 - remain_time(self.t, self.task_window[j] )
+            #     b = distance(self.uav_pos[i], self.task_pos[j][:2])
+            #     weighted_dists.append(a * b)  # 紧急度越高、距离影响越大
+            # min_weighted_dist = min(weighted_dists)
+            # R_attract = 10.0 / (1.0 + min_weighted_dist)  # 放大奖励梯度，让靠近紧急任务更“赚”
 
-            # 增强版时间窗奖励（关键修改）
-            time_remaining = remain_time(self.t, self.task_window[k])
-            urgency = 1.0 / (time_remaining + 1e-5)  # 剩余时间越少，紧迫度越高
+            # 计算当前选择任务(k)的吸引力
+            chosen_task_urgency = 1.0 - remain_time(self.t, self.task_window[k])
+            chosen_task_dist = distance(self.uav_pos[i], self.task_pos[k][:2])
+            R_attract = 10.0 * (chosen_task_urgency / (chosen_task_dist + 1.0))
 
-            # 距离衰减因子（严格单调递减）
-            dist_factor = np.exp(-2.0 * dist / self.d_max)  # 更陡峭的衰减
-
-            # 运动方向奖励（新增）
+            # # 运动方向奖励
             prev_dist = distance(prev_pos[i], self.task_pos[k][:2])
-            moving_toward = 1.2 if dist < prev_dist else 0.8  # 趋近奖励/远离惩罚
+            # 动态方向奖励（基于距离变化比例）
+            dist_ratio = (prev_dist - dist) / prev_dist  # 距离缩短的比例
+            R_direction = 10.0 * dist_ratio if dist_ratio > 0 else -1.0 * abs(dist_ratio)
+            # dist_improvement = prev_dist - dist
+            # R_direction = np.tanh(dist_improvement) * 5.0
+            # R_direction = 20.0 * np.tanh(dist_improvement / 5.0)
 
-            R_TW = urgency * dist_factor * moving_toward
+            # 剩余时间权重
+            R_TW = 1.0 - remain_time(self.t, self.task_window[k][:2])
 
-            # R_D = 0.5 * np.exp(-self.xi * a) + 0.5 / (1.0 + self.xi * a)
-            # R_D = (0.5 * np.exp(-self.xi * dist) + 0.5 / (1.0 + self.xi * dist)) * R_TW   # 目标靠近 shaping 奖励
             # 边界惩罚
-            R_border = -10.0 if (self.uav_pos[i][0] <= 0 or self.uav_pos[i][0] >= MAP_SIZE or
-                                 self.uav_pos[i][1] <= 0 or self.uav_pos[i][1] >= MAP_SIZE) else 0.0
+            R_border = -5.0 if (self.uav_pos[i][0] <= 0 or self.uav_pos[i][0] >= MAP_SIZE or
+                                self.uav_pos[i][1] <= 0 or self.uav_pos[i][1] >= MAP_SIZE) else 0.0
 
-            # 使得能量和任务量成比例
-            # R_fair = -abs((self.load[i] + 1e-5) / (np.sum(self.load) + 1e-5) -
-            #               (self.energy[i] + 1e-5) / (np.sum(self.energy) + 1e-5))
-
-            R_switch = 2.0 if k == most_urgent else 0.0
-
-            # 惩罚原地滞留
-            R_idle = -1.0 if v < 1e-3 else 0.0
+            # 在每步奖励中添加全局进度分量
+            global_progress = np.sum(
+                self.task_marked) / self.num_task  # 但是这样会导致无人机更愿意停留在已完成任务的区域，获得高R_Global奖励，而非探索新的区域
+            R_Global = 80.0 * global_progress  # 40# 整体进度奖励
 
             # 综合计算当前 UAV 的总奖励
-            reward = (self.a1 * R_S + self.a2 * R_D - self.a3 * R_E / E_MAX - self.a4 * R_C   + self.a6 * R_attract
-                      + self.a7 * R_border + self.a8 * R_TW + 5.0 * R_switch)  # + self.a8 * R_fair + 2.0 * R_idle)
+            reward += (self.a1 * R_S + self.a2 * R_D - self.a3 * R_E / E_MAX - self.a4 * R_C + self.a6 * R_attract
+                       + self.a7 * R_border + self.a8 * R_Fairness + self.a9 * R_direction + 0 * R_Global)
+            # 轻微惩罚无效选择
+            if dist > self.d_max:
+                # 惩罚与距离成正比，同时考虑 UAV 是否在远离任务点
+                penalty = -0.5 * (dist / self.d_max) if dist >= prev_dist else -0.1 * (dist / self.d_max)
+                reward += penalty
             rewards.append(reward)
 
             # 群体感知判定与任务完成,在群体任务完成判定后
@@ -265,6 +304,7 @@ class UAVEnv:
             'tasks_completed': np.sum(self.task_marked) / self.num_task,
             'energy': self.energy.copy(),
             'collision': self._count_collisions(),
+            'fairness': fairness
         }
 
         # 检查是否所有任务都已完成
@@ -282,15 +322,18 @@ class UAVEnv:
             self.t += 1
         return self._get_obs(), np.array(rewards, dtype=np.float32), done, info
 
+    # 碰撞奖励
     def _calculate_collision_reward_single(self, i):
         reward = 0.0
         for j in range(self.num_uav):
             if i != j:
                 d_ij = distance(self.uav_pos[i], self.uav_pos[j])
                 if d_ij < self.d_safe:
-                    reward += 1.0
+                    # reward += 1.0
+                    reward += 5.0  # 1.0
         return reward
 
+    # 碰撞次数
     def _count_collisions(self):
         count = 0
         for i in range(self.num_uav):
@@ -299,3 +342,8 @@ class UAVEnv:
                 if d < self.d_safe:
                     count += 1
         return count
+
+    # 能耗均衡
+    def calculate_fairness(self):
+        energy_norm = self.energy / (E_MAX + 1e-8)
+        return (np.sum(energy_norm) ** 2) / (self.num_uav * np.sum(energy_norm ** 2))

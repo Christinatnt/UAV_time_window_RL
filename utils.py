@@ -18,4 +18,5 @@ def remain_time(t, task_window):
     start_t, end_t = task_window
     # 剩余时间比例（越接近截止时间值越小）
     remaining_ratio = max(0, (end_t - current_time) / TIME_STEPS) #(end_t - start_t))
+    # remaining_ratio = max(0, (end_t - current_time) / (end_t - start_t))
     return remaining_ratio
