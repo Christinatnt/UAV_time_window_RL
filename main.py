@@ -36,7 +36,7 @@ def run_with_MADDPG(plotter, time_window_type, epochs=500):
                          title="UAV Task Completion Rate",
                          xlabel="Iteration number",
                          ylabel="Task completion rate",
-                         smooth=True,
+                         smooth=False,
                          window=5,
                          # save_name=f"MADDPG_task_completion_{timestamp}")
                          save_name=f"MADDPG_task_completion")
@@ -45,7 +45,7 @@ def run_with_MADDPG(plotter, time_window_type, epochs=500):
                          title="UAV Energy Fairness Rate",
                          xlabel="Iteration number",
                          ylabel="Fairness index",
-                         smooth=True,
+                         smooth=False,
                          window=5,
                          # save_name=f"MADDPG_task_completion_{timestamp}")
                          save_name=f"MADDPG_energy_fairness")
@@ -85,10 +85,9 @@ def run_with_MADDPG(plotter, time_window_type, epochs=500):
 
 def test_with_MADDPG(plotter, time_window_type, epochs=500):
     env = UAVEnv(time_window_type)
-    maddpg = MAPPO(env)
+    maddpg = MADDPG(env)
 
-    all_reward, all_completion, all_collision = maddpg.test(epochs)
-
+    all_reward, all_completion, all_collision, all_fairness = maddpg.test(epochs)
     # 绘制奖励曲线
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -99,8 +98,8 @@ def test_with_MADDPG(plotter, time_window_type, epochs=500):
                          ylabel="Reward",
                          smooth=True,
                          window=5,
-                         save_name=f"reward_curve_{timestamp}")
-    # save_name=f"reward_curve")
+                         # save_name=f"MADDPG_reward_curve_{timestamp}")
+                         save_name=f"MADDPG_reward_curve")
 
     # 任务完成率曲线
     plotter.plot_rewards([all_completion],
@@ -109,7 +108,17 @@ def test_with_MADDPG(plotter, time_window_type, epochs=500):
                          ylabel="Task completion rate",
                          smooth=True,
                          window=5,
-                         save_name=f"task_completion_{timestamp}")
+                         # save_name=f"MADDPG_task_completion_{timestamp}")
+                         save_name=f"MADDPG_task_completion")
+    # 能耗均衡曲线
+    plotter.plot_rewards([all_fairness],
+                         title="UAV Energy Fairness Rate",
+                         xlabel="Iteration number",
+                         ylabel="Fairness index",
+                         smooth=True,
+                         window=5,
+                         # save_name=f"MADDPG_task_completion_{timestamp}")
+                         save_name=f"MADDPG_energy_fairness")
 
     # 碰撞次数曲线
     '''plotter.plot_rewards(all_collisions,
@@ -131,13 +140,16 @@ def test_with_MADDPG(plotter, time_window_type, epochs=500):
                             save_name=f"reward_compare_curve_{timestamp}")'''
 
     # 绘制 UAV 轨迹和任务分布
-    plotter.plot_uav_trajectories(env.uav_trajectories, env.task_pos[:, :2],
+    plotter.plot_uav_trajectories(maddpg.uav_trajectories, env.task_pos[:, :2],
                                   title="UAV Trajectory and Task Distribution",
-                                  # save_name=f"trajectory_plot_{time_window_type}")
-                                  save_name=f"trajectory_plot__{timestamp}")
-
+                                  save_name=f"MADDPG_trajectory_plot_{time_window_type}")
+    # save_name=f"MADDPG_trajectory_plot__{timestamp}")
     # 绘制奖励函数曲线
-    # plotter.plot_reward_components(env.reward_history)
+    plotter.plot_reward_components(env.reward_history)
+    print(f"best task rate: {maddpg.best_task_rate}")
+    if maddpg.finish_time:
+        for k, t in maddpg.finish_time.items():
+            print(f"{k}:{t}")
     return all_reward
 
 
@@ -214,10 +226,28 @@ def run_with_GA(plotter, time_window_type, epochs=500):
 def run_with_mappo(plotter, time_window_type, epochs=100):
     env = UAVEnv(time_window_type)
     mappo = MAPPO(env)
-    all_reward, all_completion, all_collision, all_energy = mappo.train(epochs)
+    all_reward, all_completion, all_collision, all_fairness = mappo.train(epochs)
 
     # 可视化结果
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 奖励曲线
+    plotter.plot_rewards([all_reward],
+                         title="MAPPO Reward Curve",
+                         xlabel="Iteration number",
+                         ylabel="Reward",
+                         smooth=True,
+                         window=5,
+                         # save_name=f"MADDPG_reward_curve_{timestamp}")
+                         save_name=f"MAPPO_reward_curve")
+    # 能耗均衡曲线
+    plotter.plot_rewards([all_fairness],
+                         title="MAPPO Energy Fairness Rate",
+                         xlabel="Iteration number",
+                         ylabel="Fairness index",
+                         smooth=False,
+                         window=5,
+                         # save_name=f"MADDPG_task_completion_{timestamp}")
+                         save_name=f"MAPPO_energy_fairness")
     plotter.plot_rewards(
         rewards=[all_completion],  # 注意是二维列表形式
         title="MAPPO Task Completion Curve",
@@ -231,15 +261,12 @@ def run_with_mappo(plotter, time_window_type, epochs=100):
                                   # title=f"MAPPO UAV Trajectories", save_name=f"MAPPO_uav_trajectory_{timestamp}")
                                   title=f"MAPPO UAV Trajectories", save_name=f"MAPPO_uav_trajectory")
     print(f"best_task_rate: {mappo.best_task_rate}")
-    plotter.plot_rewards(
-        rewards=[all_reward],  # 注意是二维列表形式
-        title="MAPPO Reward Curve",
-        xlabel="Iteration number",
-        ylabel="Reward",
-        smooth=True,
-        window=10,
-        save_name=f"MAPPO_reward_curve")
+
     # save_name = f"MAPPO_reward_curve{timestamp}")
+    print(f"best task rate: {mappo.best_task_rate}")
+    if mappo.finish_time:
+        for k, t in mappo.finish_time.items():
+            print(f"{k}:{t}")
 
 
 # 测试MAPPO模型
@@ -324,12 +351,11 @@ if __name__ == '__main__':
     # 绘图
     plotter = Plotter()
     # MADDPG
-    run_with_MADDPG(plotter, 'normal', epochs=300)#300
+    # run_with_MADDPG(plotter, 'normal', epochs=300)#300
     # 时间窗消融实验
     # time_window_ablation_experiment(plotter, epochs=300)
     # GA
     # run_with_GA(plotter, 'normal', epochs=100)
     # MAPPO
-    # run_with_mappo(plotter, 'normal', epochs=100)
-    # run_with_mappo(plotter, 'normal', epochs=2000)
+    run_with_mappo(plotter, 'normal', epochs=300)
     # test_with_mappo(plotter, 'normal', epochs=10)#不需要过多训练？

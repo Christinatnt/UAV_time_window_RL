@@ -185,8 +185,8 @@ class MADDPG:
 
         # 保存所有Actor和Critic
         for i in range(self.num_agents):
-            actor_path = os.path.join(self.ckpt_dir, f"actor_{i}")
-            critic_path = os.path.join(self.ckpt_dir, f"critic_{i}")
+            actor_path = os.path.join(self.ckpt_dir, f"actor_{i}.h5")
+            critic_path = os.path.join(self.ckpt_dir, f"critic_{i}.h5")
             self.actor[i].save_weights(actor_path)
             self.critic[i].save_weights(critic_path)
 
@@ -198,22 +198,39 @@ class MADDPG:
         if not os.path.exists(self.ckpt_dir):
             raise FileNotFoundError(f"Checkpoint directory {self.ckpt_dir} not found")
 
-        # 加载所有Actor和Critic
         for i in range(self.num_agents):
             actor_path = os.path.join(self.ckpt_dir, f"actor_{i}")
             critic_path = os.path.join(self.ckpt_dir, f"critic_{i}")
-
-            # 检查文件是否存在
+            #检查文件是否存在
             if not (os.path.exists(actor_path + ".index") and os.path.exists(critic_path + ".index")):
                 raise FileNotFoundError(f"Model checkpoints for agent {i} not found")
-
             self.actor[i].load_weights(actor_path)
             self.critic[i].load_weights(critic_path)
+
+
+        # 先进行虚拟前向传播以构建变量
+        # dummy_obs = tf.random.normal((1, self.obs_dim * self.num_agents))
+        # dummy_act = tf.random.normal((1, self.act_dim * self.num_agents))
+        # # 加载所有Actor和Critic
+        # for i in range(self.num_agents):
+        #     actor_path = os.path.join(self.ckpt_dir, f"actor_{i}.h5")
+        #     critic_path = os.path.join(self.ckpt_dir, f"critic_{i}.h5")
+        # 构建Actor变量
+        #     _ = self.actor[i](np.zeros((1, self.obs_dim)))  # 关键步骤：触发变量创建
+        #     self.actor[i].load_weights(actor_path)
+        #
+        #     # 构建Critic变量
+        #     _ = self.critic[i](dummy_obs, dummy_act)  # 关键步骤
+        #     self.critic[i].load_weights(critic_path)
         print("Models loaded!")
 
     def act(self, obs):
         actions_for_env = []
         actions_for_train = []
+        # 添加输入检查
+        if np.any(np.isnan(obs)):
+            print("Warning: NaN in observation!")
+            obs = np.nan_to_num(obs, nan=0.0)
         for i in range(self.num_agents):
             with tf.device('/GPU:0'):
                 # 直接切片获取单个智能体的观测（避免重复转换）
@@ -295,6 +312,8 @@ class MADDPG:
 
                 # 更新 Critic
                 critic_grads = tape.gradient(critic_loss, self.critic[i].trainable_variables)  # 计算 Critic 的梯度
+                if any(np.any(np.isnan(g.numpy())) for g in critic_grads):
+                    print(f"NaN gradients in critic {i}!")
                 self.critic_optim[i].apply_gradients(
                     zip(critic_grads, self.critic[i].trainable_variables))  # 应用梯度更新 Critic 网络
 
@@ -312,6 +331,8 @@ class MADDPG:
 
                 # 更新 Actor
                 actor_grads = tape.gradient(actor_loss, self.actor[i].trainable_variables)  # 计算 Actor 的梯度
+                if any(np.any(np.isnan(g.numpy())) for g in actor_grads):
+                    print(f"NaN gradients in actor {i}!")
                 self.actor_optim[i].apply_gradients(
                     zip(actor_grads, self.actor[i].trainable_variables))  # 应用梯度更新 Actor 网络
 
@@ -354,13 +375,13 @@ class MADDPG:
 
                 # next_states, rewards, done, info = self.env.step(actions)  # 执行动作
                 try:
-                    next_states, rewards, done, info = self.env.step(actions, episode < epochs * 0.2)
+                    next_states, rewards, done = self.env.step(actions)
                 except Exception as e:
                     print(f"Env step failed: {str(e)}")
                     break
 
                 if done:
-                    if info['tasks_completed']:
+                    if self.env.all_tasks_done_time >= 0:
                         print(f"所有任务完成！耗时步数：{self.env.t}")
                     else:
                         print(f"没有可以完成的任务！")
@@ -379,6 +400,83 @@ class MADDPG:
                 states = next_states
                 episode_reward += rewards  # 添加元素
 
+                # 学习
+                if t % 10 == 0 and len(self.replay_buffer) > self.batch_size:
+                    with tf.device('/GPU:0'):
+                        self.learn()
+
+            # 记录本轮的统计数据
+            all_rewards.append(np.sum(episode_reward))
+            tasks_completed = self.env.tasks_completed/TASK_NUM
+            all_task_completion.append(tasks_completed)
+            collision = self.env.count_collisions
+            all_collisions.append(collision)
+            fairness = self.env.calculate_fairness()
+            all_fairness.append(fairness)
+
+            print(f"回合 {episode}, 平均奖励: {np.mean(episode_reward):.2f}, "
+                  f"任务完成率: {tasks_completed:.2f}, 碰撞次数: {collision}, 能耗均衡: {fairness}")
+
+            # if episode < epochs/2:
+            #     self.uav_trajectories = self.env.uav_trajectories
+            # el
+            if self.best_task_rate <= tasks_completed:
+                self.best_task_rate = tasks_completed
+                self.uav_trajectories = self.env.uav_trajectories
+                self.finish_time = self.env.finish_time
+
+            # 记录本次运行的所有回合数据
+            # 记录结束时间
+            end_time = time.time()
+
+            # 计算间隔时间
+            interval = end_time - start_time
+
+            # 打印间隔时间
+            print(f"运行 {episode} 完成，耗时 {interval:.2f} 秒")
+
+        self.save_models()
+        return all_rewards, all_task_completion, all_collisions, all_fairness
+
+    def test(self, epochs=500):
+        self.epsilon = 0.0  # 禁用探索
+        self.load_models()
+        all_rewards = []
+        all_task_completion = []
+        all_collisions = []
+        all_fairness = []
+
+        for episode in range(epochs):  # 100
+            # 记录开始时间
+            start_time = time.time()
+
+            states = self.env.reset(self.env.time_window_type)
+            episode_reward = np.zeros(self.num_agents)
+
+            for t in range(TIME_STEPS):
+
+                # 将状态数据转换为 GPU 张量
+                with tf.device('/GPU:0'):
+                    states_gpu = tf.convert_to_tensor(states, dtype=tf.float32)
+
+                # 在 GPU 上执行动作预测
+                with tf.device('/GPU:0'):
+                    actions, actions_train = self.act(states_gpu)  # 获取动作
+
+                # next_states, rewards, done, info = self.env.step(actions)  # 执行动作
+                try:
+                    next_states, rewards, done, info = self.env.step(actions)
+                except Exception as e:
+                    print(f"Env step failed: {str(e)}")
+                    break
+
+                # 如果所有任务完成
+                if "all_tasks_done_time" in info:
+                    break  # 退出当前 episode
+
+                # 更新状态和奖励
+                states = next_states
+                episode_reward += rewards
                 # 学习
                 if t % 10 == 0 and len(self.replay_buffer) > self.batch_size:
                     with tf.device('/GPU:0'):
@@ -411,80 +509,4 @@ class MADDPG:
             # 打印间隔时间
             print(f"运行 {episode} 完成，耗时 {interval:.2f} 秒")
 
-        self.save_models()
         return all_rewards, all_task_completion, all_collisions, all_fairness
-
-    def test(self, epochs=500):
-        self.epsilon = 0.0  # 禁用探索
-        self.load_models()
-        # 多次运行以获取统计数据
-        num_runs = 1  # 建议至少运行5次以获得可靠的统计
-        all_rewards = []
-        all_task_completion = []
-        all_collisions = []
-
-        for run in range(num_runs):
-            print(f"开始运行 {run + 1}/{num_runs}")
-
-            run_rewards = []
-            run_task_completion = []
-            run_collisions = []
-
-            for episode in range(epochs):  # 100
-                # 记录开始时间
-                start_time = time.time()
-
-                states = self.env.reset(self.env.time_window_type)
-                episode_reward = np.zeros(self.num_agents)
-
-                for t in range(TIME_STEPS):
-
-                    # 将状态数据转换为 GPU 张量
-                    with tf.device('/GPU:0'):
-                        states_gpu = tf.convert_to_tensor(states, dtype=tf.float32)
-
-                    # 在 GPU 上执行动作预测
-                    with tf.device('/GPU:0'):
-                        actions, actions_train = self.act(states_gpu)  # 获取动作
-
-                    # next_states, rewards, done, info = self.env.step(actions)  # 执行动作
-                    try:
-                        next_states, rewards, done, info = self.env.step(actions)
-                    except Exception as e:
-                        print(f"Env step failed: {str(e)}")
-                        break
-
-                    # 如果所有任务完成
-                    if "all_tasks_done_time" in info:
-                        break  # 退出当前 episode
-
-                    # 更新状态和奖励
-                    states = next_states
-                    episode_reward += rewards
-
-                # 记录本轮的统计数据
-                run_rewards.append(np.mean(episode_reward))
-                run_task_completion.append(info['tasks_completed'])
-                run_collisions.append(info['collision'])
-
-                print(f"运行 {run + 1}/{num_runs}, 回合 {episode}, 平均奖励: {np.mean(episode_reward):.2f}, "
-                      f"任务完成率: {info['tasks_completed']:.2f}, 碰撞次数: {info['collision']}")
-
-                if info['tasks_completed'] == 1.0:
-                    print(f"所有任务已完成！总耗时步数：{self.env.t}")
-
-                # 记录本次运行的所有回合数据
-                # 记录结束时间
-                end_time = time.time()
-
-                # 计算间隔时间
-                interval = end_time - start_time
-
-                # 打印间隔时间
-                print(f"运行 {episode} 完成，耗时 {interval:.2f} 秒")
-
-            all_rewards.append(run_rewards)
-            all_task_completion.append(run_task_completion)
-            all_collisions.append(run_collisions)
-
-        return all_rewards, all_task_completion, all_collisions

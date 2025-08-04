@@ -61,7 +61,10 @@ class PPOBuffer:
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
     def store(self, obs, act, rew, val, logp):
-        assert self.ptr < self.max_size  # buffer has to have room
+        # assert self.ptr < self.max_size  # buffer has to have room
+        if self.ptr >= self.max_size:  # 缓冲区已满
+            self.finish_path()  # 计算当前路径的 advantage 和 return
+            self.ptr, self.path_start_idx = 0, 0  # 清空缓冲区
         self.obs_buf[self.ptr] = np.array(obs).reshape(-1)
         self.act_buf[self.ptr] = np.array(act).reshape(-1)
         self.rew_buf[self.ptr] = rew  # rew 是 float
@@ -141,7 +144,8 @@ class MAPPO:
         self.target_kl = 0.01
 
         self.uav_trajectories = [[] for _ in range(self.n_agents)]
-        self.best_task_rate = 0  #TODO
+        self.best_task_rate = 0  # 记录最好结果
+        self.finish_time = 0  # 记录完成时间
         # 保存模型Checkpointing
         self.ckpt_dir = "MAPPO_checkpoints"
         self.actor_ckpt = os.path.join(self.ckpt_dir, "actor")
@@ -184,7 +188,7 @@ class MAPPO:
                                                                         labels=tf.squeeze(task_sample, axis=1))
             logp = tf.squeeze(logp_v) + tf.squeeze(logp_theta) + logp_task
 
-            task_sample_float = tf.cast(task_sample, tf.float32)
+            task_sample_float = tf.cast(task_sample, tf.float32) # tf.concat() 要求所有输入张量的数据类型必须一致，而 v_scaled 和 theta_scaled 是 float32 类型，但 task_sample_int 是 int32 类型
             act = tf.concat([v_scaled, theta_scaled, task_sample_float], axis=1)
             return act.numpy(), logp.numpy(), self.critic(obs).numpy()
 
@@ -230,41 +234,45 @@ class MAPPO:
         all_reward = []
         all_completion = []
         all_collision = []
-        all_energy = []
+        all_fairness = []
         for ep in range(epochs):
             # 记录开始时间
             start_time = time.time()
 
             obs = self.env.reset(self.env.time_window_type)
-            ep_ret, ep_len = 0, 0
+            ep_len = 0
+            episode_reward = np.zeros(UAV_NUM)
             done = False
 
             while not done:
                 act, logp, val = self.get_action(obs)
-                next_obs, rew, done, info = self.env.step(act)
+                next_obs, rew, done = self.env.step(act)
                 for i in range(self.n_agents):
                     self.buffers[i].store(obs[i], act[i], rew[i], val[i], logp[i])
                 obs = next_obs
-                ep_ret = np.mean(rew)
+                episode_reward += rew
                 ep_len += 1
 
-            if self.best_task_rate <= info['tasks_completed']:
-                self.best_task_rate = info['tasks_completed']
+            # 记录本轮的统计数据
+            all_reward.append(np.sum(episode_reward))
+            tasks_completed = self.env.tasks_completed / TASK_NUM
+            all_completion.append(tasks_completed)
+            collision = self.env.count_collisions
+            all_collision.append(collision)
+            fairness = self.env.calculate_fairness()
+            all_fairness.append(fairness)
+
+            if self.best_task_rate <= tasks_completed:
+                self.best_task_rate = tasks_completed
                 self.uav_trajectories = self.env.uav_trajectories
+                self.finish_time = self.env.finish_time
             for i in range(self.n_agents):
                 self.buffers[i].finish_path(last_val=0)
                 data = self.buffers[i].get()
                 self.update_with_data(data)
 
-            # 记录额外指标
-            all_reward.append(ep_ret)
-            all_completion.append(info['tasks_completed'])
-            all_collision.append(info['collision'])
-            all_energy.append(np.sum(info['energy']))
-
-            print(
-                f"Epoch {ep + 1:03d} | Return: {ep_ret:.3f} | Tasks Completed: {info['tasks_completed']:.2f} "
-                f"| Collisions: {info['collision']}")
+            print(f"回合 {ep}, 平均奖励: {np.mean(episode_reward):.2f}, "
+                  f"任务完成率: {tasks_completed:.2f}, 碰撞次数: {collision}, 能耗均衡: {fairness}")
 
             # 记录本次运行的所有回合数据
             # 记录结束时间
@@ -274,7 +282,7 @@ class MAPPO:
             # 打印间隔时间
             print(f"运行 {ep} 完成，耗时 {interval:.2f} 秒")
         self.save_models()
-        return all_reward, all_completion, all_collision, all_energy
+        return all_reward, all_completion, all_collision, all_fairness
 
     def test(self, episodes=10):
         self.load_models()
