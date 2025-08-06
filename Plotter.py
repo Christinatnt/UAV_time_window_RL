@@ -79,6 +79,29 @@ class Plotter:
             plt.savefig(os.path.join(self.save_dir, f"{save_name}.png"), bbox_inches='tight')
         return plt
 
+    def plot_loss(self, loss, title,
+                     xlabel, ylabel,
+                     smooth=True, window=10,
+                     save_name=None):
+        plt.figure(figsize=(10, 6))
+        x = np.arange(1, len(loss) + 1)
+
+        plt.plot(x, loss, 'b-', linewidth=2, label='平均奖励')
+
+        # plt.grid(True, linestyle='--', alpha=0.7)
+        # plt.legend(fontsize=12)
+        plt.xlabel(xlabel, fontsize=14)
+        plt.ylabel(ylabel, fontsize=14)
+        plt.title(title, fontsize=16)
+        plt.xticks(fontsize=12)
+        plt.yticks(fontsize=12)
+        # y_min = min(np.min(mean_rewards), 0)
+        # plt.ylim(y_min, plt.ylim()[1])
+
+        if save_name:
+            plt.savefig(os.path.join(self.save_dir, f"{save_name}.png"), bbox_inches='tight')
+        return plt
+
     def plot_multiple_algorithms(self, rewards_dict, title,
                                  xlabel, ylabel,
                                  smooth=True, window=10,

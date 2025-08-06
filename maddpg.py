@@ -5,6 +5,7 @@ from config import *
 from collections import deque
 import os
 import time
+from utils import *
 
 
 class Actor(tf.keras.Model):
@@ -23,6 +24,7 @@ class Actor(tf.keras.Model):
         self.out_angle = tf.keras.layers.Dense(1, activation='tanh',
                                                kernel_initializer=tf.keras.initializers.RandomUniform(-3e-3, 3e-3))
         self.out_task = tf.keras.layers.Dense(TASK_NUM, activation='softmax')
+
         # 强制在 GPU 上初始化
         with tf.device('/GPU:0'):
             # self.build(input_shape=(None, obs_dim))  # 触发权重初始化在 GPU 上
@@ -138,6 +140,7 @@ class MADDPG:
         self.finish_time = {}
         self.best_task_rate = 0.0
         self.uav_trajectories = [[] for _ in range(UAV_NUM)]
+        self.loss = []
 
         # 为智能体并行化预先分配内存
         self.obs_flat = tf.Variable(tf.zeros([self.batch_size, self.obs_dim * self.num_agents]))
@@ -201,12 +204,11 @@ class MADDPG:
         for i in range(self.num_agents):
             actor_path = os.path.join(self.ckpt_dir, f"actor_{i}")
             critic_path = os.path.join(self.ckpt_dir, f"critic_{i}")
-            #检查文件是否存在
+            # 检查文件是否存在
             if not (os.path.exists(actor_path + ".index") and os.path.exists(critic_path + ".index")):
                 raise FileNotFoundError(f"Model checkpoints for agent {i} not found")
             self.actor[i].load_weights(actor_path)
             self.critic[i].load_weights(critic_path)
-
 
         # 先进行虚拟前向传播以构建变量
         # dummy_obs = tf.random.normal((1, self.obs_dim * self.num_agents))
@@ -331,8 +333,8 @@ class MADDPG:
 
                 # 更新 Actor
                 actor_grads = tape.gradient(actor_loss, self.actor[i].trainable_variables)  # 计算 Actor 的梯度
-                if any(np.any(np.isnan(g.numpy())) for g in actor_grads):
-                    print(f"NaN gradients in actor {i}!")
+                # if any(np.any(np.isnan(g.numpy())) for g in actor_grads):
+                #     print(f"NaN gradients in actor {i}!")
                 self.actor_optim[i].apply_gradients(
                     zip(actor_grads, self.actor[i].trainable_variables))  # 应用梯度更新 Actor 网络
 
@@ -407,7 +409,7 @@ class MADDPG:
 
             # 记录本轮的统计数据
             all_rewards.append(np.sum(episode_reward))
-            tasks_completed = self.env.tasks_completed/TASK_NUM
+            tasks_completed = self.env.tasks_completed / TASK_NUM
             all_task_completion.append(tasks_completed)
             collision = self.env.count_collisions
             all_collisions.append(collision)
@@ -510,3 +512,212 @@ class MADDPG:
             print(f"运行 {episode} 完成，耗时 {interval:.2f} 秒")
 
         return all_rewards, all_task_completion, all_collisions, all_fairness
+
+    # 专家策略生成
+    def get_expert_action(self, uav_index, env, current_time):
+        unfinished = [j for j in range(len(env.task_pos)) if not env.task_marked[j]]
+        withinTW = [j for j in unfinished if current_time <= env.task_window[j][1]]
+        if not withinTW:
+            return [0.0, 0.0, random.randint(0, TASK_NUM-1)]
+
+        scores = []
+        for j in withinTW:
+            urgency = 1.0 - remain_time(current_time, env.task_window[j])
+            closest = distance(env.uav_pos[uav_index], env.task_pos[j][:2])
+            scores.append(urgency / (closest + 1e-5))
+
+        optimal_task = withinTW[np.argmax(scores)]
+        target = env.task_pos[optimal_task][:2]
+        vec = target - env.uav_pos[uav_index]
+        speed = min(np.linalg.norm(vec), V_MAX)
+        angle = np.arctan2(vec[1], vec[0])
+        return [speed, angle, optimal_task]
+
+    #数据生成器，用专家策略采集demo
+    def collect_expert_data(self, env, time_window_type, num_episodes=100):
+        D_demo = []  # [(obs, expert_action)]
+        for _ in range(num_episodes):
+            obs = env.reset(time_window_type)
+            for t in range(TIME_STEPS):
+                actions = []
+                for i in range(env.num_uav):
+                    expert = self.get_expert_action(
+                        i, env, t
+                    )
+                    actions.append(expert)
+
+                # 保存状态与专家动作
+                for i in range(env.num_uav):
+                    state = obs[i]
+                    speed, angle, task_id = actions[i]
+                    expert_action = np.zeros(2 + TASK_NUM)
+                    expert_action[0] = speed / V_MAX
+                    expert_action[1] = angle / np.pi
+                    expert_action[2 + task_id] = 1.0
+                    D_demo.append((state, expert_action))
+                    # 构造一个虚假的 transition：reward 设为0 或设为 shaping 奖励
+                    dummy_next_obs = obs  # 或使用 obs 填充（真实交互也可）
+                    dummy_reward = 0.0  # 或自定义 shaping 奖励
+                    dummy_done = False
+                    self.replay_buffer.add((obs, [expert_action] * UAV_NUM, [dummy_reward] * UAV_NUM,
+                                               dummy_next_obs, dummy_done))
+
+                # 环境推进
+                obs, _, done = env.step(actions)
+                if done:
+                    break
+        return D_demo
+
+    # 模仿学习：训练Actor网络是其输出模仿专家动作
+    def train_behavior_cloning(self, D_demo, epochs=80):
+        optimizer = tf.keras.optimizers.Adam(1e-4)
+        mse_loss = tf.keras.losses.MeanSquaredError()
+        ce_loss = tf.keras.losses.CategoricalCrossentropy()
+
+        # 直接从列表创建数据集，避免中间NumPy数组
+        # 先处理 D_demo 中第一个样本，将 obs 和 act 转为 numpy 数组获取形状
+        # 假设 D_demo 元素是 (obs_list, act_list) 形式，这里取出第一个 obs 和 act 转成数组
+        first_obs_np = np.array(D_demo[0][0], dtype=np.float32)
+        first_act_np = np.array(D_demo[0][1], dtype=np.float32)
+
+        # 直接从列表创建数据集，避免中间NumPy数组（修改 output_signature ）
+        dataset = tf.data.Dataset.from_generator(
+            lambda: ((obs, act) for obs, act in D_demo),
+            output_signature=(
+                tf.TensorSpec(shape=first_obs_np.shape, dtype=tf.float32),
+                tf.TensorSpec(shape=first_act_np.shape, dtype=tf.float32)
+            )
+        )
+
+        # 使用GPU（如果可用）进行后续处理
+        with tf.device('/GPU:0' if tf.test.is_gpu_available() else '/CPU:0'):
+            dataset = dataset.shuffle(10000).batch(self.batch_size)
+
+
+        for epoch in range(epochs):
+            total_loss = 0
+            # 记录开始时间
+            start_time = time.time()
+            for obs_batch, act_batch in dataset:
+                with tf.device('/GPU:0'):
+                    with tf.GradientTape(persistent=True) as tape:
+                        for i, actor in enumerate(self.actor):
+                            pred = actor(obs_batch)
+
+                            # # --- 分离动作分量 ---
+                            # pred_speed = pred[:, 0:1]  # [B,1]
+                            # pred_angle = pred[:, 1:2]  # [B,1]
+                            pred_task = pred[:, 2:]  # [B, TASK_NUM]
+
+                            # true_speed = act_batch[:, 0:1]
+                            # true_angle = act_batch[:, 1:2]
+                            true_task = act_batch[:, 2:]
+
+
+                            # --- 计算损失 ---
+                            # loss_speed = mse_loss(true_speed, pred_speed)
+                            # loss_angle = mse_loss(true_angle, pred_angle)
+                            # loss_task = ce_loss(true_task, pred_task)
+                            #
+                            # loss = 0 * loss_speed + 0 * loss_angle + 1.0 * loss_task
+                            loss = ce_loss(true_task, pred_task)
+
+                            grads = tape.gradient(loss, actor.trainable_variables)
+                            optimizer.apply_gradients(zip(grads, actor.trainable_variables))
+
+                            total_loss += loss.numpy()
+
+            print(f"[BC Epoch {epoch}] Avg Loss: {total_loss / len(self.actor):.4f}")
+            # 记录本次运行的所有回合数据
+            # 记录结束时间
+            end_time = time.time()
+
+            # 计算间隔时间
+            interval = end_time - start_time
+
+            # 打印间隔时间
+            print(f"运行 {epoch} 完成，耗时 {interval:.2f} 秒")
+            self.loss.append(total_loss)
+
+    # def train_behavior_cloning(self, D_demo, epochs=80):
+    #     optimizer = tf.keras.optimizers.Adam(1e-4)
+    #     loss_fn = tf.keras.losses.MeanSquaredError()
+    #
+    #     # 直接从列表创建数据集，避免中间NumPy数组
+    #     # 先处理 D_demo 中第一个样本，将 obs 和 act 转为 numpy 数组获取形状
+    #     # 假设 D_demo 元素是 (obs_list, act_list) 形式，这里取出第一个 obs 和 act 转成数组
+    #     first_obs_np = np.array(D_demo[0][0], dtype=np.float32)
+    #     first_act_np = np.array(D_demo[0][1], dtype=np.float32)
+    #
+    #     # 直接从列表创建数据集，避免中间NumPy数组（修改 output_signature ）
+    #     dataset = tf.data.Dataset.from_generator(
+    #         lambda: ((obs, act) for obs, act in D_demo),
+    #         output_signature=(
+    #             tf.TensorSpec(shape=first_obs_np.shape, dtype=tf.float32),
+    #             tf.TensorSpec(shape=first_act_np.shape, dtype=tf.float32)
+    #         )
+    #     )
+    #
+    #     # 使用GPU（如果可用）进行后续处理
+    #     with tf.device('/GPU:0' if tf.test.is_gpu_available() else '/CPU:0'):
+    #         dataset = dataset.shuffle(10000).batch(self.batch_size)
+    #
+    #     for epoch in range(epochs):
+    #         total_loss = 0
+    #         # 记录开始时间
+    #         start_time = time.time()
+    #         for obs_batch, act_batch in dataset:
+    #             with tf.device('/GPU:0'):
+    #                 with tf.GradientTape(persistent=True) as tape:
+    #                     for i, actor in enumerate(self.actor):
+    #                         pred = actor(obs_batch)
+    #                         loss = loss_fn(act_batch, pred)
+    #                         grads = tape.gradient(loss, actor.trainable_variables)
+    #                         optimizer.apply_gradients(zip(grads, actor.trainable_variables))
+    #                         total_loss += loss.numpy()
+    #         print(f"[BC Epoch {epoch}] Avg Loss: {total_loss / len(self.actor):.4f}")
+    #         # 打印间隔时间
+    #         end_time = time.time()
+    #         interval = end_time - start_time
+    #         print(f"运行 {epoch} 完成，耗时 {interval:.2f} 秒")
+    #         self.loss.append(total_loss)
+
+    def dagger_training(self, iterations=10, steps_per_iter=100):
+        D = []  # 初始数据集
+
+        for it in range(iterations):
+            print(f"[DAgger] Iteration {it + 1}")
+
+            obs = self.env.reset(self.env.time_window_type)
+
+            for t in range(steps_per_iter):
+                actions, _ = self.act(tf.convert_to_tensor(obs, dtype=tf.float32))  # agent 执行动作
+                new_obs, reward, done = self.env.step(actions)
+                actions_train = []
+                # 对每个 agent 获取专家动作
+                for i in range(self.num_agents):
+                    expert_action = self.get_expert_action(i, self.env, self.env.t)
+                    speed, angle, task_id = expert_action
+
+                    expert_vec = np.zeros(2 + TASK_NUM)
+                    expert_vec[0] = speed / V_MAX
+                    expert_vec[1] = angle / np.pi
+                    expert_vec[2 + task_id] = 1.0
+                    actions_train.append(expert_vec)
+                    D.append((obs[i], expert_vec))  # 记录当前 agent 所处状态及专家动作
+
+                self.replay_buffer.add((
+                    obs,  # 旧视野
+                    actions_train,  # 走法
+                    reward,
+                    new_obs,  # 新视野
+                    done  # 原始终止标志
+                ))
+
+                obs = new_obs
+                if done:
+                    break
+
+            # 更新 actor
+            self.train_behavior_cloning(D, epochs=30)
+

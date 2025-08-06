@@ -17,10 +17,24 @@ import json
 def run_with_MADDPG(plotter, time_window_type, epochs=500):
     env = UAVEnv(time_window_type)
     maddpg = MADDPG(env)
+    D_demo = maddpg.collect_expert_data(env, time_window_type, 1000)
+    maddpg.train_behavior_cloning(D_demo, 50)#80#50#20#loss需要降到1～5才算是基本学会
+    # 第二步：使用 DAgger 迭代收集数据 + 模仿训练
+    maddpg.dagger_training(iterations=60, steps_per_iter=100)#iterations=60  # 可调节轮数与每轮步数
     all_reward, all_completion, all_collision, all_fairness = maddpg.train(epochs)
     # 绘制奖励曲线
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # 奖励曲线
+    if not maddpg.loss:
+        plotter.plot_loss([maddpg.loss],
+                             title="UAV Reward Curve",
+                             xlabel="Iteration number",
+                             ylabel="Reward",
+                             smooth=True,
+                             window=5,
+                             # save_name=f"MADDPG_loss_curve_{timestamp}")
+                             save_name=f"MADDPG_loss_curve")
     # 奖励曲线
     plotter.plot_rewards([all_reward],
                          title="UAV Reward Curve",
@@ -351,11 +365,11 @@ if __name__ == '__main__':
     # 绘图
     plotter = Plotter()
     # MADDPG
-    # run_with_MADDPG(plotter, 'normal', epochs=300)#300
+    run_with_MADDPG(plotter, 'none', epochs=300)#300
     # 时间窗消融实验
     # time_window_ablation_experiment(plotter, epochs=300)
     # GA
     # run_with_GA(plotter, 'normal', epochs=100)
     # MAPPO
-    run_with_mappo(plotter, 'normal', epochs=300)
+    # run_with_mappo(plotter, 'normal', epochs=300)
     # test_with_mappo(plotter, 'normal', epochs=10)#不需要过多训练？
