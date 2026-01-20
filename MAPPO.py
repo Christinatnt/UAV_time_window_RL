@@ -255,7 +255,7 @@ class MAPPO:
 
             # 记录本轮的统计数据
             all_reward.append(np.sum(episode_reward))
-            tasks_completed = self.env.tasks_completed / TASK_NUM
+            tasks_completed = self.env.task_marked.sum() / TASK_NUM
             all_completion.append(tasks_completed)
             collision = self.env.count_collisions
             all_collision.append(collision)
